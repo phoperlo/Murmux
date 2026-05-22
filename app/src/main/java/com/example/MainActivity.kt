@@ -28,6 +28,7 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
@@ -76,6 +77,7 @@ sealed class AppState {
         val downloadPercent: Int? = null
     ) : AppState()
     data class StorageError(val requiredSpace: String, val availableSpace: String) : AppState()
+    data class NetworkError(val errorDetail: String) : AppState()
     object TerminalActive : AppState()
 }
 
@@ -140,6 +142,9 @@ fun ConsoleApp(modifier: Modifier = Modifier) {
                                 onStorageError = { req, avail ->
                                     currentAppState = AppState.StorageError(req, avail)
                                 },
+                                onNetworkError = { detail ->
+                                    currentAppState = AppState.NetworkError(detail)
+                                },
                                 onSuccess = {
                                     sharedPrefs.edit().putBoolean("is_installed", true).apply()
                                     currentAppState = AppState.TerminalActive
@@ -172,6 +177,25 @@ fun ConsoleApp(modifier: Modifier = Modifier) {
                 StorageErrorView(
                     requiredSpace = state.requiredSpace,
                     availableSpace = state.availableSpace,
+                    onRetry = {
+                        currentAppState = AppState.InitialPrompt
+                    },
+                    onExit = {
+                        var act = context
+                        while (act is android.content.ContextWrapper) {
+                            if (act is ComponentActivity) {
+                                break
+                            }
+                            act = act.baseContext
+                        }
+                        (act as? ComponentActivity)?.finishAndRemoveTask()
+                    }
+                )
+            }
+
+            is AppState.NetworkError -> {
+                NetworkErrorView(
+                    errorDetail = state.errorDetail,
                     onRetry = {
                         currentAppState = AppState.InitialPrompt
                     },
@@ -514,6 +538,112 @@ fun StorageErrorView(
 }
 
 /**
+ * Dedicated Network Error View Layout for clean status reporting
+ */
+@Composable
+fun NetworkErrorView(
+    errorDetail: String,
+    onRetry: () -> Unit,
+    onExit: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF0C0C0C)),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            modifier = Modifier
+                .widthIn(max = 380.dp)
+                .padding(24.dp)
+                .background(Color(0xFF1E1E1E))
+                .border(1.dp, Color(0xFFFF9800)) // Warning Yellow/Orange Border
+                .padding(24.dp),
+            horizontalAlignment = Alignment.Start
+        ) {
+            Text(
+                text = "NET_CONNECTION_FAILURE",
+                style = MaterialTheme.typography.bodyMedium.copy(
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.sp
+                ),
+                modifier = Modifier.padding(bottom = 8.dp)
+            )
+
+            // Mini high-resolution yellow separator
+            Box(
+                modifier = Modifier
+                    .width(32.dp)
+                    .height(1.dp)
+                    .background(Color(0xFFFF9800))
+                    .padding(bottom = 16.dp)
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text(
+                text = "$errorDetail\n\nПожалуйста, убедитесь, что у вас есть подключение к Интернету, и повторите попытку.",
+                style = MaterialTheme.typography.bodyMedium.copy(
+                    color = Color(0xFF8E8E8E),
+                    lineHeight = 22.sp
+                ),
+                modifier = Modifier.padding(bottom = 24.dp)
+            )
+
+            // Vertical buttons stack for consistency in layout
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Button(
+                    onClick = onRetry,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color.White,
+                        contentColor = Color.Black
+                    ),
+                    shape = RectangleShape
+                ) {
+                    Text(
+                        text = "ПОВТОРИТЬ",
+                        style = MaterialTheme.typography.labelLarge.copy(
+                            color = Color.Black,
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 1.sp
+                        )
+                    )
+                }
+
+                Button(
+                    onClick = onExit,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .border(1.dp, Color(0xFF8E8E8E)),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color.Transparent,
+                        contentColor = Color(0xFF8E8E8E)
+                    ),
+                    shape = RectangleShape
+                ) {
+                    Text(
+                        text = "ВЫХОД",
+                        style = MaterialTheme.typography.labelLarge.copy(
+                            color = Color(0xFF8E8E8E),
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 1.sp
+                        )
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
  * 4. Actual interactive Terminal Screen View (Active session console)
  */
 @Composable
@@ -529,6 +659,14 @@ fun TerminalConsoleView() {
     val listState = rememberLazyListState()
     val focusRequester = remember { FocusRequester() }
     val focusManager = LocalFocusManager.current
+
+    // Toggle states for CTRL and ALT keys
+    var isCtrlActive by remember { mutableStateOf(false) }
+    var isAltActive by remember { mutableStateOf(false) }
+
+    // Keyboard (IME) visibility detection to dynamically hide/collapse rows and save vertical space
+    val density = LocalDensity.current
+    val isKeyboardVisible = WindowInsets.ime.getBottom(density) > 0
 
     // Initialize our Background Linux Process
     val terminalProcess = remember {
@@ -669,7 +807,29 @@ fun TerminalConsoleView() {
 
             BasicTextField(
                 value = currentCommandText,
-                onValueChange = { currentCommandText = it },
+                onValueChange = { newVal ->
+                    // 1. Intercept typed letters when CTRL modifier is toggled active
+                    if (isCtrlActive && newVal.length > currentCommandText.length) {
+                        val lastChar = newVal.lastOrNull()
+                        if (lastChar != null && lastChar.isLetter()) {
+                            val charLower = lastChar.lowercaseChar()
+                            terminalProcess.writeInput("ctrl+$charLower\n")
+                            isCtrlActive = false
+                            return@BasicTextField
+                        }
+                    }
+                    // 2. Intercept typed letters when ALT modifier is toggled active
+                    if (isAltActive && newVal.length > currentCommandText.length) {
+                        val lastChar = newVal.lastOrNull()
+                        if (lastChar != null && lastChar.isLetter()) {
+                            val charLower = lastChar.lowercaseChar()
+                            terminalProcess.writeInput("alt+$charLower\n")
+                            isAltActive = false
+                            return@BasicTextField
+                        }
+                    }
+                    currentCommandText = newVal
+                },
                 modifier = Modifier
                     .weight(1f)
                     .focusRequester(focusRequester)
@@ -689,6 +849,8 @@ fun TerminalConsoleView() {
                     onSend = {
                         sendCommand(currentCommandText)
                         currentCommandText = ""
+                        isCtrlActive = false
+                        isAltActive = false
                     }
                 )
             )
@@ -696,39 +858,40 @@ fun TerminalConsoleView() {
 
         Spacer(modifier = Modifier.height(6.dp))
 
-        // Quick shell command shortcut keys
-        Row(
-            modifier = Modifier
-                .fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            val shortCmds = listOf("help", "neofetch", "ls -la", "uname -a", "apt update", "clear")
-            shortCmds.forEach { cmd ->
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .border(1.dp, Color(0xFF333333))
-                        .background(Color(0xFF151515))
-                        .clickable {
-                            sendCommand(cmd)
-                        }
-                        .padding(vertical = 10.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = cmd,
-                        style = MaterialTheme.typography.bodySmall.copy(
-                            color = Color(0xFFC0C0C0),
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold
-                        ),
-                        maxLines = 1
-                    )
+        // Quick shell command shortcut keys (Hides dynamically when keyboard is opened, to save space!)
+        if (!isKeyboardVisible) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                val shortCmds = listOf("help", "neofetch", "ls -la", "uname -a", "apt update", "clear")
+                shortCmds.forEach { cmd ->
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .border(1.dp, Color(0xFF333333))
+                            .background(Color(0xFF151515))
+                            .clickable {
+                                sendCommand(cmd)
+                            }
+                            .padding(vertical = 10.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = cmd,
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                color = Color(0xFFC0C0C0),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            ),
+                            maxLines = 1
+                        )
+                    }
                 }
             }
+            Spacer(modifier = Modifier.height(6.dp))
         }
-
-        Spacer(modifier = Modifier.height(6.dp))
 
         // Sophisticated Dark design theme Terminal Control Bar (Grid styling)
         Row(
@@ -739,11 +902,12 @@ fun TerminalConsoleView() {
         ) {
             val controlKeys = listOf("ESC", "TAB", "CTRL", "ALT", "-", "+")
             controlKeys.forEachIndexed { index, label ->
+                val isActive = (label == "CTRL" && isCtrlActive) || (label == "ALT" && isAltActive)
                 Box(
                     modifier = Modifier
                         .weight(1f)
                         .height(44.dp)
-                        .background(Color(0xFF0C0C0C))
+                        .background(if (isActive) Color.White else Color(0xFF0C0C0C))
                         .then(
                             if (index < controlKeys.size - 1) {
                                 Modifier.border(
@@ -758,21 +922,44 @@ fun TerminalConsoleView() {
                             when (label) {
                                 "ESC" -> {
                                     currentCommandText = ""
+                                    terminalProcess.writeInput("esc\n")
+                                    isCtrlActive = false
+                                    isAltActive = false
                                 }
                                 "TAB" -> {
-                                    currentCommandText += "    "
+                                    terminalProcess.writeInput("\t")
+                                    isCtrlActive = false
+                                    isAltActive = false
                                 }
                                 "CTRL" -> {
-                                    currentCommandText = "CTRL+" + currentCommandText
+                                    isCtrlActive = !isCtrlActive
+                                    isAltActive = false
                                 }
                                 "ALT" -> {
-                                    currentCommandText = "ALT+" + currentCommandText
+                                    isAltActive = !isAltActive
+                                    isCtrlActive = false
                                 }
                                 "-" -> {
-                                    currentCommandText += "-"
+                                    if (isCtrlActive) {
+                                        terminalProcess.writeInput("ctrl+-\n")
+                                        isCtrlActive = false
+                                    } else if (isAltActive) {
+                                        terminalProcess.writeInput("alt+-\n")
+                                        isAltActive = false
+                                    } else {
+                                        currentCommandText += "-"
+                                    }
                                 }
                                 "+" -> {
-                                    currentCommandText += "+"
+                                    if (isCtrlActive) {
+                                        terminalProcess.writeInput("ctrl++\n")
+                                        isCtrlActive = false
+                                    } else if (isAltActive) {
+                                        terminalProcess.writeInput("alt++\n")
+                                        isAltActive = false
+                                    } else {
+                                        currentCommandText += "+"
+                                    }
                                 }
                             }
                         },
@@ -781,8 +968,8 @@ fun TerminalConsoleView() {
                     Text(
                         text = label,
                         style = MaterialTheme.typography.bodySmall.copy(
-                            color = Color(0xFF8E8E8E),
-                            fontSize = 10.sp,
+                            color = if (isActive) Color.Black else Color(0xFF8E8E8E),
+                            fontSize = 11.sp,
                             fontWeight = FontWeight.Bold,
                             letterSpacing = 1.sp
                         )
@@ -802,6 +989,7 @@ private suspend fun setupUbuntuEnvironment(
     onProgressText: (String) -> Unit,
     onPercent: (Int) -> Unit,
     onStorageError: (String, String) -> Unit,
+    onNetworkError: (String) -> Unit,
     onSuccess: () -> Unit
 ) = withContext(Dispatchers.IO) {
     try {
@@ -812,16 +1000,16 @@ private suspend fun setupUbuntuEnvironment(
             onLog(log)
         }
 
-        // Setup size defaults
-        var activeUrl = "https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release/ubuntu-base-20.04.5-base-arm64.tar.gz"
-        var archiveSizeInBytes: Long = 85L * 1024 * 1024 // 85 MB estimate default
+        // Setup size defaults - Prefer real Ubuntu Focal Live Server ISO as requested by the user
+        var activeUrl = "https://old-releases.ubuntu.com/releases/20.04.4/ubuntu-20.04-live-server-arm64.iso"
+        var archiveSizeInBytes: Long = 1387225088L // ~1.29 GB
 
         if (checkResult != null) {
             activeUrl = checkResult.first
             archiveSizeInBytes = checkResult.second
             onLog("Выбрано рабочее зеркало: $activeUrl (${SystemCore.formatBytes(archiveSizeInBytes)})")
         } else {
-            onLog("Зеркала не дали ответа. Использование резервного узла и локальной сборки...")
+            onLog("Зеркала не дали прямого ответа. Использование основного образа системы...")
         }
 
         // Step 2: Verify Space allocation
@@ -857,7 +1045,7 @@ private suspend fun setupUbuntuEnvironment(
             onLog("Ошибка: Не удалось скачать образ системы по сети.")
             onLog("Реальная установка прервана из-за сетевого сбоя.")
             withContext(Dispatchers.Main) {
-                onStorageError("Сбой сети (404/Timeout)", "Пожалуйста, проверьте интернет-соединение")
+                onNetworkError("Сбой сети (404/Timeout при попытке скачать $activeUrl)")
             }
             return@withContext
         } else {
@@ -880,5 +1068,8 @@ private suspend fun setupUbuntuEnvironment(
     } catch (e: Exception) {
         onLog("Критический сбой: ${e.localizedMessage}")
         Log.e("SetupProcedure", "Fatal exception", e)
+        withContext(Dispatchers.Main) {
+            onNetworkError("Непредвиденный критический сбой: ${e.localizedMessage}")
+        }
     }
 }

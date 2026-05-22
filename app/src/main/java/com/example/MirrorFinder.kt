@@ -34,8 +34,8 @@ object MirrorFinder {
                 val url = URL(mirror)
                 val connection = url.openConnection() as HttpURLConnection
                 connection.requestMethod = "HEAD"
-                connection.connectTimeout = 3000
-                connection.readTimeout = 3000
+                connection.connectTimeout = 10000
+                connection.readTimeout = 10000
                 connection.instanceFollowRedirects = true
 
                 val responseCode = connection.responseCode
