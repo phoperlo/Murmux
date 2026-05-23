@@ -126,6 +126,8 @@ object SystemCore {
 
         onStatus("Генерация встроенных утилит и пакетов (sys/bin/)...")
         writeUbuntuShellScripts(baseDir)
+        onStatus("Оптимизация прав доступа файлов и линкеров...")
+        applySystemPermissionsSweep(baseDir)
         onStatus("Окружение Ubuntu 20.04 ARM64 успешно инициализировано.")
     }
 
@@ -435,7 +437,9 @@ object SystemCore {
             echo "            .-/++/-."
             echo ""
         """.trimIndent()
-        writeFileAndPerms(File(binDir, "neofetch"), neofetchContent)
+        if (!hasRealOrWrappedExecutable(baseDir, "neofetch")) {
+            writeFileAndPerms(File(binDir, "neofetch"), neofetchContent)
+        }
 
         // 3. uname override to match Ubuntu 20.04 ARM64
         val unameContent = """
@@ -447,7 +451,9 @@ object SystemCore {
                 /system/bin/uname "${'$'}@"
             fi
         """.trimIndent()
-        writeFileAndPerms(File(binDir, "uname"), unameContent)
+        if (!hasRealOrWrappedExecutable(baseDir, "uname")) {
+            writeFileAndPerms(File(binDir, "uname"), unameContent)
+        }
 
         // 4. Nano text editor implementation - fully functional interactive CLI text editor!
         val nanoContent = """
@@ -602,7 +608,9 @@ object SystemCore {
             done
             rm -f "${'$'}tmpFile"
         """.trimIndent()
-        writeFileAndPerms(File(binDir, "nano"), nanoContent)
+        if (!hasRealOrWrappedExecutable(baseDir, "nano")) {
+            writeFileAndPerms(File(binDir, "nano"), nanoContent)
+        }
 
         // 5. Python 3 Interperter & REPL Console Shell
         val pythonContent = """
@@ -718,8 +726,10 @@ object SystemCore {
                 fi
             done
         """.trimIndent()
-        writeFileAndPerms(File(binDir, "python3"), pythonContent)
-        writeFileAndPerms(File(binDir, "python"), pythonContent)
+        if (!hasRealOrWrappedExecutable(baseDir, "python3") && !hasRealOrWrappedExecutable(baseDir, "python")) {
+            writeFileAndPerms(File(binDir, "python3"), pythonContent)
+            writeFileAndPerms(File(binDir, "python"), pythonContent)
+        }
 
         // 6. apt package manager simulation
         val aptContentSim = """
@@ -1166,7 +1176,32 @@ EOF
             echo "=========================================================="
             echo ""
         """.trimIndent()
-        writeFileAndPerms(File(binDir, "bash"), bashContent)
+        if (!hasRealOrWrappedExecutable(baseDir, "bash")) {
+            writeFileAndPerms(File(binDir, "bash"), bashContent)
+        }
+
+        // 6. Write custom native bash launch profile (.bashrc)
+        val rootHome = File(baseDir, "root")
+        if (!rootHome.exists()) rootHome.mkdirs()
+        val welcomeMsg = """
+            # Murmux Ubuntu Terminal Welcome Profile
+            if [ -n "${'$'}BASH_VERSION" ]; then
+                echo "=========================================================="
+                echo "   Welcome to Isolated Murmux Ubuntu 20.04 LTS (ARM64)!"
+                echo "   Running REAL, native GNU/Linux dynamic binaries on Android."
+                echo "   Type 'help' for available commands or 'apt install ...'."
+                echo "=========================================================="
+                echo ""
+                export PS1='root@murmux:\w# '
+                alias help='sh /sys/bin/help'
+            fi
+        """.trimIndent()
+        try {
+            File(rootHome, ".bashrc").writeText(welcomeMsg)
+        } catch (_: Exception) {}
+
+        // 7. Perform automatically dynamic package wrappers sweep for real Ubuntu ELF packages
+        applyELFPackageWrappersSweep(baseDir)
     }
 
     private fun writeFileAndPerms(file: File, contents: String) {
@@ -1176,6 +1211,124 @@ EOF
             file.setReadable(true, false)
         } catch (e: Exception) {
             Log.e(TAG, "Failed writing file ${file.name}: ${e.message}")
+        }
+    }
+
+    fun applySystemPermissionsSweep(baseDir: File) {
+        try {
+            val dirsToSweep = listOf(
+                File(baseDir, "bin"),
+                File(baseDir, "sbin"),
+                File(baseDir, "usr/bin"),
+                File(baseDir, "usr/sbin"),
+                File(baseDir, "usr/local/bin"),
+                File(baseDir, "usr/games"),
+                File(baseDir, "lib"),
+                File(baseDir, "lib64")
+            )
+            dirsToSweep.forEach { dir ->
+                if (dir.exists() && dir.isDirectory) {
+                    dir.walkTopDown().forEach { file ->
+                        if (file.isFile) {
+                            val shouldExec = if (dir.name.contains("lib")) {
+                                file.name.endsWith(".sh") || 
+                                file.name.contains("ld-linux") || 
+                                file.name.startsWith("ld-")
+                            } else {
+                                true
+                            }
+                            if (shouldExec) {
+                                file.setExecutable(true, false)
+                                file.setReadable(true, false)
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed system permissions sweep: ${e.message}")
+        }
+    }
+
+    fun isElfBinary(file: File): Boolean {
+        if (!file.exists() || !file.isFile) return false
+        if (file.name.endsWith(".real")) return false
+        return try {
+            file.inputStream().use { fis ->
+                val header = ByteArray(4)
+                val read = fis.read(header)
+                read >= 4 &&
+                        header[0] == 0x7F.toByte() &&
+                        header[1] == 'E'.toByte() &&
+                        header[2] == 'L'.toByte() &&
+                        header[3] == 'F'.toByte()
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun hasRealOrWrappedExecutable(baseDir: File, name: String): Boolean {
+        val binDir = File(baseDir, "bin")
+        if (File(binDir, "$name.real").exists()) return true
+        val searchDirs = listOf(
+            File(baseDir, "usr/bin/$name"),
+            File(baseDir, "usr/sbin/$name"),
+            File(baseDir, "sbin/$name"),
+            File(baseDir, "usr/games/$name")
+        )
+        return searchDirs.any { it.exists() && it.isFile }
+    }
+
+    fun applyELFPackageWrappersSweep(baseDir: File) {
+        val binDir = File(baseDir, "bin")
+        if (!binDir.exists()) binDir.mkdirs()
+        
+        val dynamicLinkerPath = findDynamicLinker(baseDir)
+        
+        val targetDirs = listOf(
+            File(baseDir, "bin"),
+            File(baseDir, "sbin"),
+            File(baseDir, "usr/bin"),
+            File(baseDir, "usr/sbin"),
+            File(baseDir, "usr/games")
+        )
+        
+        targetDirs.forEach { dir ->
+            if (dir.exists() && dir.isDirectory) {
+                dir.listFiles()?.forEach { file ->
+                    if (file.isFile && isElfBinary(file)) {
+                        val isInsideBin = (dir.absolutePath == binDir.absolutePath)
+                        val realBinaryFile = if (isInsideBin) {
+                            val destRealFile = File(binDir, "${file.name}.real")
+                            if (!destRealFile.exists()) {
+                                file.renameTo(destRealFile)
+                            } else {
+                                file.delete()
+                            }
+                            destRealFile
+                        } else {
+                            file
+                        }
+                        
+                        val targetWrapperFile = File(binDir, file.name)
+                        val relativePath = realBinaryFile.absolutePath.substringAfter(baseDir.absolutePath).removePrefix("/")
+                        
+                        val wrapperContent = """
+                            #!/system/bin/sh
+                            sysPath="${baseDir.absolutePath}"
+                            exec "$dynamicLinkerPath" --library-path "${'$'}{sysPath}/lib/aarch64-linux-gnu:${'$'}{sysPath}/usr/lib/aarch64-linux-gnu:${'$'}{sysPath}/lib:${'$'}{sysPath}/usr/lib:${'$'}{sysPath}/lib/arm-linux-gnueabihf:${'$'}{sysPath}/usr/lib/arm-linux-gnueabihf" "${'$'}{sysPath}/$relativePath" "${'$'}@"
+                        """.trimIndent()
+                        
+                        targetWrapperFile.writeText(wrapperContent)
+                        targetWrapperFile.setExecutable(true, false)
+                        targetWrapperFile.setReadable(true, false)
+                        
+                        realBinaryFile.setExecutable(true, false)
+                        realBinaryFile.setReadable(true, false)
+                    }
+                }
+            }
         }
     }
 
@@ -1769,6 +1922,7 @@ class TerminalProcess(private val context: Context, private val onOutput: (Strin
 
             // Auto-heal/update basic commands and apt wrapper for this session
             SystemCore.writeUbuntuShellScripts(baseDir)
+            SystemCore.applySystemPermissionsSweep(baseDir)
 
             val pb = ProcessBuilder("/system/bin/sh")
             // Ensure root directory exists and start directly inside it
@@ -1782,7 +1936,7 @@ class TerminalProcess(private val context: Context, private val onOutput: (Strin
             val sysPath = baseDir.absolutePath
             
             // Set precise isolated POSIX environments as requested
-            env["PATH"] = "$sysPath/bin:$sysPath/usr/bin:/system/bin:/system/xbin"
+            env["PATH"] = "/system/bin:/system/xbin:$sysPath/bin:$sysPath/usr/bin"
             env["HOME"] = "$sysPath/root"
             env["USER"] = "root"
             env["LOGNAME"] = "root"
@@ -1815,7 +1969,7 @@ class TerminalProcess(private val context: Context, private val onOutput: (Strin
             startAptWatcher()
 
             // Trigger greeting session from murmux customized bash
-            writeInput("bash\n")
+            writeInput("sh " + File(baseDir, "bin/bash").absolutePath + "\n")
         } catch (e: Exception) {
             onOutput("E: Ошибка создания сессии: ${e.message}\n")
         }

@@ -729,7 +729,53 @@ fun TerminalConsoleView() {
                         consoleLogs.add("cd: no such file or directory: $target")
                     }
                 } else {
-                    terminalProcess.writeInput("$trimmedCmd\n")
+                    // To resolve Android 10+ SELinux execute restriction, run internal script wrappers via sh
+                    val sysRootDir = File(context.filesDir, "sys")
+                    val binDir = File(sysRootDir, "bin")
+                    val firstWord = parts.getOrNull(0) ?: ""
+                    
+                    fun isShellScript(file: File): Boolean {
+                        if (!file.exists() || !file.isFile) return false
+                        return try {
+                            file.inputStream().use { fis ->
+                                val header = ByteArray(4)
+                                val read = fis.read(header)
+                                read >= 2 && header[0] == '#'.toByte() && header[1] == '!'.toByte()
+                            }
+                        } catch (_: Exception) {
+                            false
+                        }
+                    }
+
+                    val processedCmd = if (firstWord.startsWith("./") || firstWord.startsWith("/")) {
+                        val rootHome = File(sysRootDir, "root")
+                        val currentPhysicalDir = when {
+                            currentDirRelativePath == "~" -> rootHome
+                            currentDirRelativePath == "/" -> sysRootDir
+                            currentDirRelativePath.startsWith("~/") -> File(rootHome, currentDirRelativePath.removePrefix("~/"))
+                            currentDirRelativePath.startsWith("/") -> File(sysRootDir, currentDirRelativePath.removePrefix("/"))
+                            else -> File(sysRootDir, currentDirRelativePath)
+                        }
+                        val targetFile = if (firstWord.startsWith("./")) {
+                            File(currentPhysicalDir, firstWord.removePrefix("./"))
+                        } else {
+                            File(sysRootDir, firstWord.removePrefix("/"))
+                        }
+                        if (targetFile.exists() && targetFile.isFile && isShellScript(targetFile)) {
+                            "sh " + targetFile.absolutePath + " " + trimmedCmd.substringAfter(firstWord).trim()
+                        } else {
+                            trimmedCmd
+                        }
+                    } else {
+                        val binFile = File(binDir, firstWord)
+                        if (binFile.exists() && binFile.isFile && isShellScript(binFile)) {
+                            "sh " + binFile.absolutePath + " " + trimmedCmd.substringAfter(firstWord).trim()
+                        } else {
+                            trimmedCmd
+                        }
+                    }
+                    
+                    terminalProcess.writeInput("$processedCmd\n")
                 }
             }
         }
